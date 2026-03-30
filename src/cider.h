@@ -238,4 +238,14 @@ NSString *argValue(int argc, char *argv[], int startIdx,
 BOOL argHasFlag(int argc, char *argv[], int startIdx,
                 const char *flag1, const char *flag2);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Passwords commands (passwords.m)
+// ─────────────────────────────────────────────────────────────────────────────
+
+void cmdPasswordsList(NSString *csvPath, BOOL jsonOutput);
+void cmdPasswordsShow(NSUInteger idx, NSString *csvPath, BOOL jsonOutput);
+void cmdPasswordsSearch(NSString *query, NSString *csvPath, BOOL jsonOutput);
+void cmdPasswordsSync(NSString *csvPath);
+void printPasswordsHelp(void);
+
 #endif /* CIDER_H */

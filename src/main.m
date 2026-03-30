@@ -22,6 +22,7 @@ void printHelp(void) {
 "  cider rem [subcommand]      Reminders operations\n"
 "  cider msg [subcommand]      iMessage operations\n"
 "  cider sync [subcommand]     Notes <-> Markdown sync\n"
+"  cider passwords [sub]       Keychain passwords + Vaultwarden sync\n"
 "  cider --version             Show version\n"
 "\n"
 "Run 'cider <command> --help' for details on any command.\n"
@@ -2364,6 +2365,61 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             return entry->handler(argc, argv);
+        }
+
+        if ([cmd isEqualToString:@"passwords"] || [cmd isEqualToString:@"pw"]) {
+            if (argc >= 3 && (strcmp(argv[2], "--help") == 0 ||
+                               strcmp(argv[2], "-h") == 0)) {
+                printPasswordsHelp();
+                return 0;
+            }
+
+            BOOL jsonOut = argHasFlag(argc, argv, 2, "--json", NULL);
+
+            if (argc == 2 || strcmp(argv[2], "list") == 0) {
+                // optional: cider passwords list [file.csv]
+                NSString *csvArg = nil;
+                int startIdx = strcmp(argv[2], "list") == 0 ? 3 : 2;
+                for (int i = startIdx; i < argc; i++) {
+                    if (argv[i][0] != '-') { csvArg = @(argv[i]); break; }
+                }
+                cmdPasswordsList(csvArg, jsonOut);
+                return 0;
+            }
+
+            if (strcmp(argv[2], "show") == 0) {
+                if (argc < 4) { fprintf(stderr, "Usage: cider passwords show <N> [file.csv]\n"); return 1; }
+                NSUInteger idx = (NSUInteger)atol(argv[3]);
+                NSString *csvArg = nil;
+                for (int i = 4; i < argc; i++) {
+                    if (argv[i][0] != '-') { csvArg = @(argv[i]); break; }
+                }
+                cmdPasswordsShow(idx, csvArg, jsonOut);
+                return 0;
+            }
+
+            if (strcmp(argv[2], "search") == 0) {
+                if (argc < 4) { fprintf(stderr, "Usage: cider passwords search <query> [file.csv]\n"); return 1; }
+                NSString *csvArg = nil;
+                for (int i = 4; i < argc; i++) {
+                    if (argv[i][0] != '-') { csvArg = @(argv[i]); break; }
+                }
+                cmdPasswordsSearch(@(argv[3]), csvArg, jsonOut);
+                return 0;
+            }
+
+            if (strcmp(argv[2], "sync") == 0) {
+                NSString *csvArg = nil;
+                for (int i = 3; i < argc; i++) {
+                    if (argv[i][0] != '-') { csvArg = @(argv[i]); break; }
+                }
+                cmdPasswordsSync(csvArg);
+                return 0;
+            }
+
+            fprintf(stderr, "Unknown passwords subcommand: %s\n", argv[2]);
+            printPasswordsHelp();
+            return 1;
         }
 
         fprintf(stderr, "Unknown command: %s\n"
