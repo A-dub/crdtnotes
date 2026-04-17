@@ -347,7 +347,62 @@ NSString *editableToRawText(NSString *edited) {
     return result;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Notes.app lifecycle helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static BOOL isNotesRunning(void) {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/pgrep";
+    task.arguments = @[@"-x", @"Notes"];
+    task.standardOutput = [NSPipe pipe];
+    task.standardError = [NSPipe pipe];
+    [task launch];
+    [task waitUntilExit];
+    return task.terminationStatus == 0;
+}
+
+static void killNotes(void) {
+    // SIGKILL — prevents a graceful save-on-exit from Notes.app, which would
+    // write its stale in-memory model back to the WAL and race our write.
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/pkill";
+    task.arguments = @[@"-9", @"-x", @"Notes"];
+    task.standardOutput = [NSPipe pipe];
+    task.standardError = [NSPipe pipe];
+    [task launch];
+    [task waitUntilExit];
+
+    // Wait up to 3s for the process to fully exit before we write
+    for (int i = 0; i < 30; i++) {
+        if (!isNotesRunning()) break;
+        [NSThread sleepForTimeInterval:0.1];
+    }
+}
+
+static void openNotes(void) {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/open";
+    task.arguments = @[@"-a", @"Notes"];
+    task.standardOutput = [NSPipe pipe];
+    task.standardError = [NSPipe pipe];
+    [task launch];
+}
+
 BOOL saveContext(void) {
+    // Notes.app uploads to CloudKit from its in-memory Core Data model, not
+    // from disk. If Notes is running when cider writes, it will never see the
+    // change and will upload stale content on its next sync cycle.
+    //
+    // Fix: kill Notes before writing so its in-memory model is gone. After
+    // cider commits to the WAL, Notes restarts and loads fresh from the store
+    // (SQLite readers always see all committed WAL frames on open), then pushes
+    // the correct content to CloudKit.
+    BOOL notesWasRunning = isNotesRunning();
+    if (notesWasRunning) {
+        killNotes();
+    }
+
     // Use saveImmediately — the no-arg save on ICNoteContext preserves CloudKit
     // dirty flags (needsToBePushedToCloud), while save: can clear them.
     BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(
@@ -363,11 +418,14 @@ BOOL saveContext(void) {
         }
     }
 
-    // Notify Notes.app of external database change so it syncs to CloudKit
-    if (ok) {
-        // Post via Darwin notification (cross-process)
+    if (notesWasRunning) {
+        // Reopen Notes.app — it loads fresh from the store, sees our committed
+        // WAL writes, and pushes them to CloudKit.
+        if (ok) openNotes();
+    } else {
+        // Notes wasn't open; post cross-process notifications as a courtesy
+        // in case Notes opens later and needs a nudge.
         notify_post("ICEditorExtensionDidSaveNotification");
-        // Also post via the coordinator as backup
         id coord = ((id (*)(id, SEL))objc_msgSend)(
             g_ctx, NSSelectorFromString(@"crossProcessChangeCoordinator"));
         if (coord) {

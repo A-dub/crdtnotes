@@ -8,11 +8,132 @@
 #import "cider.h"
 #include <sqlite3.h>
 
+static sqlite3 *g_msgDB = NULL;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hanging-indent helper: continuation lines align with first line's text
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void printHanging(const char *prefix, const char *body) {
+    int indent = (int)strlen(prefix);
+    const char *p = body;
+    BOOL first = YES;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        int len = nl ? (int)(nl - p) : (int)strlen(p);
+        if (first) {
+            printf("%s%.*s\n", prefix, len, p);
+            first = NO;
+        } else {
+            printf("%*s%.*s\n", indent, "", len, p);
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+
+static NSString *describeAttachmentForMessage(int64_t rowid) {
+    if (rowid <= 0 || !g_msgDB) return @"attachment";
+
+    const char *sql =
+        "SELECT a.transfer_name, a.filename, a.mime_type, a.uti "
+        "FROM attachment a "
+        "JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID "
+        "WHERE maj.message_id = ? "
+        "ORDER BY a.ROWID ASC LIMIT 1";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_msgDB, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return @"attachment";
+    }
+
+    sqlite3_bind_int64(stmt, 1, rowid);
+
+    NSString *label = @"attachment";
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *transferName = (const char *)sqlite3_column_text(stmt, 0);
+        const char *filename = (const char *)sqlite3_column_text(stmt, 1);
+        const char *mime = (const char *)sqlite3_column_text(stmt, 2);
+        const char *uti = (const char *)sqlite3_column_text(stmt, 3);
+
+        NSString *name = nil;
+        if (transferName && strlen(transferName) > 0) {
+            name = [NSString stringWithUTF8String:transferName];
+        } else if (filename && strlen(filename) > 0) {
+            name = [[NSString stringWithUTF8String:filename] lastPathComponent];
+        }
+
+        NSString *kind = nil;
+        if (mime && strncmp(mime, "image/", 6) == 0) kind = @"image";
+        else if (mime && strncmp(mime, "video/", 6) == 0) kind = @"video";
+        else if (mime && strncmp(mime, "audio/", 6) == 0) kind = @"audio";
+        else if (mime && strcmp(mime, "application/pdf") == 0) kind = @"pdf";
+        else if (uti && strstr(uti, "contact") != NULL) kind = @"contact";
+        else if (uti && strstr(uti, "vcard") != NULL) kind = @"contact";
+        else if (uti && strstr(uti, "calendar") != NULL) kind = @"calendar";
+        else if (mime && strlen(mime) > 0) kind = [NSString stringWithUTF8String:mime];
+        else if (uti && strlen(uti) > 0) kind = [NSString stringWithUTF8String:uti];
+
+        if (name.length > 0) {
+            // Transfer names often include an internal GUID prefix; keep the human part.
+            NSRange space = [name rangeOfString:@" "];
+            if (space.location != NSNotFound && space.location + 1 < name.length) {
+                NSString *tail = [name substringFromIndex:space.location + 1];
+                if ([tail rangeOfString:@"."] .location != NSNotFound) {
+                    name = tail;
+                }
+            }
+        }
+
+        if (name.length > 0 && kind.length > 0) {
+            label = [NSString stringWithFormat:@"%@: %@", kind, name];
+        } else if (name.length > 0) {
+            label = name;
+        } else if (kind.length > 0) {
+            label = kind;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return label;
+}
+
+static NSString *displayMsgText(NSString *text, BOOL hasAttach, int64_t rowid) {
+    NSString *attachmentLabel = hasAttach ?
+        [NSString stringWithFormat:@"[%@]", describeAttachmentForMessage(rowid)] : nil;
+    if (!text || text.length == 0) {
+        return attachmentLabel ?: @"";
+    }
+
+    NSString *objectReplacement = @"\uFFFC";
+    if ([text isEqualToString:objectReplacement]) {
+        return attachmentLabel ?: @"[object]";
+    }
+
+    // Some attachment messages include replacement chars plus private-use junk.
+    if (hasAttach) {
+        NSString *trimmed = [[text stringByReplacingOccurrencesOfString:objectReplacement
+                                                             withString:@""]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0 || [trimmed canBeConvertedToEncoding:NSASCIIStringEncoding] == NO) {
+            return attachmentLabel;
+        }
+        NSString *rendered = [[text stringByReplacingOccurrencesOfString:objectReplacement
+                                                              withString:attachmentLabel]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([rendered rangeOfString:@"<U+"].location != NSNotFound) {
+            return attachmentLabel;
+        }
+        return rendered;
+    }
+
+    return [text stringByReplacingOccurrencesOfString:objectReplacement
+                                           withString:@"[object]"];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Database access
 // ─────────────────────────────────────────────────────────────────────────────
-
-static sqlite3 *g_msgDB = NULL;
 
 static NSString *messagesDBPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:
@@ -535,7 +656,7 @@ void cmdMsgShow(const char *chatRef, NSUInteger limit, BOOL jsonOutput,
             // Regular message
             BOOL fromMe = [msg[@"is_from_me"] boolValue];
             NSDate *d = msg[@"date"];
-            NSString *text = msg[@"text"] ?: @"";
+            NSString *text = displayMsgText(msg[@"text"], [msg[@"has_attachments"] boolValue], [msg[@"rowid"] longLongValue]);
             NSString *sender = fromMe ? @"You" : (msg[@"sender"] ?: @"?");
             BOOL hasAttach = [msg[@"has_attachments"] boolValue];
 
@@ -551,13 +672,16 @@ void cmdMsgShow(const char *chatRef, NSUInteger limit, BOOL jsonOutput,
             // Edited indicator
             BOOL edited = msg[@"date_edited"] && ![msg[@"date_edited"] isEqual:[NSNull null]];
 
-            printf("  [%s] %s: %s%s%s\n",
-                   (d && ![d isEqual:[NSNull null]]) ?
-                       [formatMsgDateShort(d) UTF8String] : "",
-                   [sender UTF8String],
-                   [text UTF8String],
-                   hasAttach ? " 📎" : "",
-                   edited ? " (edited)" : "");
+            {
+                NSString *suffix = [NSString stringWithFormat:@"%s%s",
+                    hasAttach ? " 📎" : "", edited ? " (edited)" : ""];
+                NSString *body = [text stringByAppendingString:suffix];
+                NSString *prefix = [NSString stringWithFormat:@"  [%s] %s: ",
+                    (d && ![d isEqual:[NSNull null]]) ?
+                        [formatMsgDateShort(d) UTF8String] : "",
+                    [sender UTF8String]];
+                printHanging([prefix UTF8String], [body UTF8String]);
+            }
         }
         printf("\n");
     }
@@ -797,7 +921,7 @@ void cmdMsgContext(const char *msgGuid, NSUInteger context, BOOL jsonOutput,
 
             BOOL fromMe = [r[@"is_from_me"] boolValue];
             NSDate *d = r[@"date"];
-            NSString *text = r[@"text"] ?: @"";
+            NSString *text = displayMsgText(r[@"text"], [r[@"has_attachments"] boolValue], [r[@"rowid"] longLongValue]);
             NSString *sender = fromMe ? @"You" : (r[@"sender"] ?: @"?");
             BOOL hasAttach = [r[@"has_attachments"] boolValue];
             BOOL retracted = r[@"date_retracted"] && ![r[@"date_retracted"] isEqual:[NSNull null]];
@@ -805,14 +929,17 @@ void cmdMsgContext(const char *msgGuid, NSUInteger context, BOOL jsonOutput,
 
             if (retracted) text = @"(unsent)";
 
-            printf("%s  [%s] %s: %s%s%s\n",
-                   isTarget ? ">>>" : "   ",
-                   (d && ![d isEqual:[NSNull null]]) ?
-                       [formatMsgDateShort(d) UTF8String] : "",
-                   [sender UTF8String],
-                   [text UTF8String],
-                   hasAttach ? " 📎" : "",
-                   edited ? " (edited)" : "");
+            {
+                NSString *suffix = [NSString stringWithFormat:@"%s%s",
+                    hasAttach ? " 📎" : "", edited ? " (edited)" : ""];
+                NSString *body = [text stringByAppendingString:suffix];
+                NSString *prefix = [NSString stringWithFormat:@"%s  [%s] %s: ",
+                    isTarget ? ">>>" : "   ",
+                    (d && ![d isEqual:[NSNull null]]) ?
+                        [formatMsgDateShort(d) UTF8String] : "",
+                    [sender UTF8String]];
+                printHanging([prefix UTF8String], [body UTF8String]);
+            }
         }
 
         printf("\n");
@@ -834,7 +961,7 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
 
     NSString *sql = [NSString stringWithFormat:
         @"SELECT m.ROWID, m.guid, m.text, m.date, m.is_from_me, "
-        @"h.id as handle_address, c.guid as chat_guid, "
+        @"m.cache_has_attachments, h.id as handle_address, c.guid as chat_guid, "
         @"c.chat_identifier, c.display_name, c.service_name "
         @"FROM message m "
         @"JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
@@ -858,13 +985,15 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
         // Tab-delimited: GUID<tab>display line
         // Pipe to fzf, then: cut -f1 to get the GUID
         while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t rowid = sqlite3_column_int64(stmt, 0);
             const char *guid = (const char *)sqlite3_column_text(stmt, 1);
             const char *text = (const char *)sqlite3_column_text(stmt, 2);
             int64_t date = sqlite3_column_int64(stmt, 3);
             int isFromMe = sqlite3_column_int(stmt, 4);
-            const char *handle = (const char *)sqlite3_column_text(stmt, 5);
-            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 7);
-            const char *displayName = (const char *)sqlite3_column_text(stmt, 8);
+            int hasAttach = sqlite3_column_int(stmt, 5);
+            const char *handle = (const char *)sqlite3_column_text(stmt, 6);
+            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 8);
+            const char *displayName = (const char *)sqlite3_column_text(stmt, 9);
 
             NSDate *d = dateFromChatDB(date);
             NSString *sender = isFromMe ? @"You" :
@@ -872,8 +1001,9 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
             NSString *chatName = (displayName && strlen(displayName) > 0) ?
                 [NSString stringWithUTF8String:displayName] :
                 (chatIdent ? [NSString stringWithUTF8String:chatIdent] : @"?");
-            NSString *msgText = text ?
-                [NSString stringWithUTF8String:text] : @"(no text)";
+            NSString *msgText = displayMsgText(text ?
+                [NSString stringWithUTF8String:text] : nil, hasAttach, rowid);
+            if (msgText.length == 0) msgText = @"(no text)";
             msgText = [msgText stringByReplacingOccurrencesOfString:@"\n"
                                                         withString:@" "];
             msgText = truncStr(msgText, 80);
@@ -894,21 +1024,25 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
         int idx = 0;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             if (idx > 0) printf(",\n");
+            int64_t rowid = sqlite3_column_int64(stmt, 0);
             const char *guid = (const char *)sqlite3_column_text(stmt, 1);
             const char *text = (const char *)sqlite3_column_text(stmt, 2);
             int64_t date = sqlite3_column_int64(stmt, 3);
             int isFromMe = sqlite3_column_int(stmt, 4);
-            const char *handle = (const char *)sqlite3_column_text(stmt, 5);
-            const char *chatGuid = (const char *)sqlite3_column_text(stmt, 6);
-            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 7);
-            const char *displayName = (const char *)sqlite3_column_text(stmt, 8);
+            int hasAttach = sqlite3_column_int(stmt, 5);
+            const char *handle = (const char *)sqlite3_column_text(stmt, 6);
+            const char *chatGuid = (const char *)sqlite3_column_text(stmt, 7);
+            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 8);
+            const char *displayName = (const char *)sqlite3_column_text(stmt, 9);
 
             NSDate *d = dateFromChatDB(date);
+            NSString *msgText = displayMsgText(text ?
+                [NSString stringWithUTF8String:text] : nil, hasAttach, rowid);
 
             printf("  {\n");
             printf("    \"guid\": \"%s\",\n", guid ?: "");
             printf("    \"text\": \"%s\",\n",
-                   text ? [jsonEscapeString([NSString stringWithUTF8String:text]) UTF8String] : "");
+                   [jsonEscapeString(msgText) UTF8String]);
             printf("    \"date\": \"%s\",\n",
                    d ? [isoDateString(d) UTF8String] : "");
             printf("    \"is_from_me\": %s,\n", isFromMe ? "true" : "false");
@@ -925,13 +1059,15 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
     } else {
         int idx = 0;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t rowid = sqlite3_column_int64(stmt, 0);
             const char *guid = (const char *)sqlite3_column_text(stmt, 1);
             const char *text = (const char *)sqlite3_column_text(stmt, 2);
             int64_t date = sqlite3_column_int64(stmt, 3);
             int isFromMe = sqlite3_column_int(stmt, 4);
-            const char *handle = (const char *)sqlite3_column_text(stmt, 5);
-            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 7);
-            const char *displayName = (const char *)sqlite3_column_text(stmt, 8);
+            int hasAttach = sqlite3_column_int(stmt, 5);
+            const char *handle = (const char *)sqlite3_column_text(stmt, 6);
+            const char *chatIdent = (const char *)sqlite3_column_text(stmt, 8);
+            const char *displayName = (const char *)sqlite3_column_text(stmt, 9);
 
             NSDate *d = dateFromChatDB(date);
             NSString *sender = isFromMe ? @"You" :
@@ -939,8 +1075,9 @@ void cmdMsgSearch(NSString *query, NSUInteger limit, BOOL jsonOutput,
             NSString *chatName = (displayName && strlen(displayName) > 0) ?
                 [NSString stringWithUTF8String:displayName] :
                 (chatIdent ? [NSString stringWithUTF8String:chatIdent] : @"?");
-            NSString *msgText = text ?
-                [NSString stringWithUTF8String:text] : @"(no text)";
+            NSString *msgText = displayMsgText(text ?
+                [NSString stringWithUTF8String:text] : nil, hasAttach, rowid);
+            if (msgText.length == 0) msgText = @"(no text)";
             msgText = [msgText stringByReplacingOccurrencesOfString:@"\n"
                                                         withString:@" "];
             msgText = truncStr(msgText, 60);
@@ -1745,7 +1882,7 @@ int cmdMsgExport(const char *chatRef, NSString *outputPath, NSString *format) {
 
     // Get all messages
     const char *sql =
-        "SELECT m.text, m.date, m.is_from_me, h.id as handle_address, "
+        "SELECT m.ROWID, m.text, m.date, m.is_from_me, h.id as handle_address, "
         "m.cache_has_attachments "
         "FROM message m "
         "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
@@ -1776,18 +1913,21 @@ int cmdMsgExport(const char *chatRef, NSString *outputPath, NSString *format) {
 
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *text = (const char *)sqlite3_column_text(stmt, 0);
-        int64_t date = sqlite3_column_int64(stmt, 1);
-        int isFromMe = sqlite3_column_int(stmt, 2);
-        const char *handle = (const char *)sqlite3_column_text(stmt, 3);
-        int hasAttach = sqlite3_column_int(stmt, 4);
+        int64_t rowid = sqlite3_column_int64(stmt, 0);
+        const char *text = (const char *)sqlite3_column_text(stmt, 1);
+        int64_t date = sqlite3_column_int64(stmt, 2);
+        int isFromMe = sqlite3_column_int(stmt, 3);
+        const char *handle = (const char *)sqlite3_column_text(stmt, 4);
+        int hasAttach = sqlite3_column_int(stmt, 5);
 
         NSDate *d = dateFromChatDB(date);
 
+        NSString *body = displayMsgText(text ? [NSString stringWithUTF8String:text] : nil,
+                                        hasAttach, rowid);
         fprintf(fp, "[%s] %s: %s%s\n",
                 d ? [formatMsgDate(d) UTF8String] : "",
                 isFromMe ? "Me" : (handle ?: "?"),
-                text ?: "",
+                [body UTF8String],
                 hasAttach ? " 📎" : "");
         count++;
     }
