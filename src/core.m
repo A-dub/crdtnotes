@@ -3,6 +3,7 @@
  */
 
 #import "cider.h"
+#include <sqlite3.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global state
@@ -347,43 +348,118 @@ NSString *editableToRawText(NSString *edited) {
     return result;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CloudKit sync health check + Notes.app lifecycle helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns YES if Notes.app has notes that have been pending upload for longer
+// than the given number of seconds — a reliable signal that the CloudKit sync
+// engine is broken (e.g. after an iCloud settings toggle clears the account
+// registration).  Uses a separate read-only sqlite3 connection so it doesn't
+// interfere with the ICNoteContext WAL connection.
+static BOOL notesSyncIsStuckForSeconds(NSInteger seconds) {
+    NSString *dbPath = [NSHomeDirectory() stringByAppendingPathComponent:
+        @"Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"];
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2([dbPath UTF8String], &db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) != SQLITE_OK)
+        return NO;
+
+    // ZMODIFICATIONDATE is stored as CoreData CFAbsoluteTime (seconds since
+    // 2001-01-01). Unix epoch offset = 978307200.
+    NSString *sql = [NSString stringWithFormat:
+        @"SELECT count(*) FROM ZICCLOUDSTATE cs "
+        @"JOIN ZICCLOUDSYNCINGOBJECT z ON z.ZCLOUDSTATE = cs.Z_PK "
+        @"WHERE cs.ZCURRENTLOCALVERSION > 0 "
+        @"AND cs.ZCURRENTLOCALVERSION > cs.ZLATESTVERSIONSYNCEDTOCLOUD "
+        @"AND z.ZMODIFICATIONDATE < (strftime('%%s','now') - 978307200 - %ld)",
+        (long)seconds];
+
+    sqlite3_stmt *stmt = NULL;
+    BOOL stuck = NO;
+    if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            stuck = sqlite3_column_int(stmt, 0) > 0;
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return stuck;
+}
+
+static BOOL isNotesRunning(void) {
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @"/usr/bin/pgrep";
+    t.arguments = @[@"-x", @"Notes"];
+    t.standardOutput = [NSPipe pipe];
+    t.standardError = [NSPipe pipe];
+    [t launch]; [t waitUntilExit];
+    return t.terminationStatus == 0;
+}
+
+static void killNotes(void) {
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @"/usr/bin/pkill";
+    t.arguments = @[@"-9", @"-x", @"Notes"];
+    t.standardOutput = [NSPipe pipe];
+    t.standardError = [NSPipe pipe];
+    [t launch]; [t waitUntilExit];
+    for (int i = 0; i < 30 && isNotesRunning(); i++)
+        [NSThread sleepForTimeInterval:0.1];
+}
+
+static void openNotes(void) {
+    NSTask *t = [[NSTask alloc] init];
+    t.launchPath = @"/usr/bin/open";
+    t.arguments = @[@"-a", @"Notes"];
+    t.standardOutput = [NSPipe pipe];
+    t.standardError = [NSPipe pipe];
+    [t launch];
+}
+
 BOOL saveContext(void) {
     // Use saveImmediately — the no-arg save on ICNoteContext preserves CloudKit
     // dirty flags (needsToBePushedToCloud), while save: can clear them.
     //
-    // Cross-process sync: the NoteStore.sqlite is opened with both
-    // NSPersistentHistoryTrackingKey and NSPersistentStoreRemoteChangeNotificationPostOptionKey
-    // enabled. CoreData automatically posts NSPersistentStoreRemoteChangeNotification
-    // to Notes.app's ICManagedObjectContextUpdater after our write, which fetches
-    // the persistent history and merges our changes into Notes.app's in-memory model.
-    // Notes.app's CloudKit engine then sees the updated objects and pushes to iCloud.
+    // Normal sync path: NoteStore.sqlite is opened with NSPersistentHistoryTracking
+    // and NSPersistentStoreRemoteChangeNotificationPostOptionKey both set. CoreData
+    // automatically posts NSPersistentStoreRemoteChangeNotification to Notes.app's
+    // ICManagedObjectContextUpdater after our write, which merges our changes into
+    // Notes.app's in-memory model so the CloudKit engine can push them to iCloud.
     BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(
         g_ctx, NSSelectorFromString(@"saveImmediately"));
     if (!ok) {
-        // Fallback to save: with error reporting
         NSError *err = nil;
         ok = ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(
             g_ctx, NSSelectorFromString(@"save:"), &err);
-        if (err) {
+        if (err)
             fprintf(stderr, "Save error: %s\n",
                     [[err localizedDescription] UTF8String]);
-        }
     }
 
-    // Belt-and-suspenders: also post the editor extension notification,
-    // which triggers Notes.app's registered handler to call requestUpdate
-    // on its ICManagedObjectContextUpdater.
-    if (ok) {
-        notify_post("ICEditorExtensionDidSaveNotification");
-        id coord = ((id (*)(id, SEL))objc_msgSend)(
-            g_ctx, NSSelectorFromString(@"crossProcessChangeCoordinator"));
-        if (coord) {
-            ((void (*)(id, SEL))objc_msgSend)(
-                coord,
-                NSSelectorFromString(@"postEditorExtensionDidSaveNotification"));
-        }
+    if (!ok) return NO;
+
+    // Belt-and-suspenders: post the editor-extension notification, which triggers
+    // Notes.app's registered handler to call requestUpdate on its context updater.
+    notify_post("ICEditorExtensionDidSaveNotification");
+    id coord = ((id (*)(id, SEL))objc_msgSend)(
+        g_ctx, NSSelectorFromString(@"crossProcessChangeCoordinator"));
+    if (coord)
+        ((void (*)(id, SEL))objc_msgSend)(
+            coord, NSSelectorFromString(@"postEditorExtensionDidSaveNotification"));
+
+    // Broken-sync recovery: if Notes.app is running but has notes that have been
+    // pending upload for > 90 seconds, its CloudKit sync engine is stalled (e.g.
+    // after an iCloud settings change clears the account registration). In that
+    // case fall back to kill+restart so Notes re-registers and flushes the queue.
+    if (isNotesRunning() && notesSyncIsStuckForSeconds(90)) {
+        fprintf(stderr, "Warning: Notes.app CloudKit sync is stalled "
+                        "(pending uploads older than 90s). "
+                        "Restarting Notes to recover...\n");
+        killNotes();
+        openNotes();
     }
-    return ok;
+
+    return YES;
 }
 
 BOOL applyCRDTEdit(id note, NSString *oldText, NSString *newText) {
